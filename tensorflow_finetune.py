@@ -1,4 +1,8 @@
 """
+Source: https://gist.github.com/omoindrot/dedc857cdc0e680dfb1be99762990c9c/
+Added model saver and summary writer.
+
+
 Example TensorFlow script for finetuning a VGG model on your own data.
 Uses tf.contrib.data module which is in release v1.2
 Based on PyTorch example from Justin Johnson
