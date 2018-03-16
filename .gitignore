@@ -1,4 +1,3 @@
 *.zip
-Azure*
-ExportedEstimate.xlsx
-
+*.xml
+.idea*

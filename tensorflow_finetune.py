@@ -1,12 +1,23 @@
+# -*- coding: utf-8 -*-
+
 """
-Source: https://gist.github.com/omoindrot/dedc857cdc0e680dfb1be99762990c9c/
-Added model saver and summary writer.
+Modified based on https://gist.github.com/omoindrot/dedc857cdc0e680dfb1be99762990c9c/.
+Modifications:
+1. Added model saver and summary writer
+2. Made the code compatible to tf v1.4 - Use tf.data.Dataset instead of tf.contrib.data.Dataset since the fuctions are
+going to be deprecated in future versions
+3. Added learning rate decay
+4. Added data augmentation (TODO: still need to be refined)
+5. Provided options for other optimization algorithms
 
+Reference for learning rate decay:
+https://kwotsin.github.io/tech/2017/02/11/transfer-learning.html
 
+==> Original Introduction <==
 Example TensorFlow script for finetuning a VGG model on your own data.
 Uses tf.contrib.data module which is in release v1.2
-Based on PyTorch example from Justin Johnson
-(https://gist.github.com/jcjohnson/6e41e8512c17eae5da50aebef3378a4c)
+Based on PyTorch example from Justin Johnson:
+https://gist.github.com/jcjohnson/6e41e8512c17eae5da50aebef3378a4c
 
 Required packages: tensorflow (v1.2)
 Download the weights trained on ImageNet for VGG:
@@ -54,207 +65,117 @@ coco-animals/
 
 import argparse
 import os
-
+import sys
+from tl_util.image_preprocess import *
+from tl_util.tl_vgg_utils import *
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
-import tensorflow.contrib.slim.nets
+import tensorflow.contrib.slim.nets  # need to explicitly import nets, otherwise you will see an AttributeError
+# The problem is caused by the fact that https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/slim/
+# __init__.py does not export nets.
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_dir', default='/home/your/train/dir')
 parser.add_argument('--val_dir', default='/home/your/validation/dir')
-parser.add_argument('--model_path', default='vgg_16.ckpt', type=str)
-parser.add_argument('--new_model_save_path', default='/home/your/new/model/save/dir/')
+parser.add_argument('--train_from_vgg', default=False, type=bool)
+parser.add_argument('--pretrained_model_path', default='vgg_16.ckpt', type=str)
+parser.add_argument('--new_model_save_path', default='/home/your/new/model/save/dir/', type=str)
+parser.add_argument('--optimizer', default='GradientDescent', type=str)
 parser.add_argument('--batch_size', default=16, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
+parser.add_argument('--data_augmentation', default=False, type=bool)
 parser.add_argument('--num_epochs1', default=10, type=int)
 parser.add_argument('--num_epochs2', default=10, type=int)
-parser.add_argument('--learning_rate1', default=1e-3, type=float)
-parser.add_argument('--learning_rate2', default=1e-5, type=float)
+parser.add_argument('--initial_learning_rate1', default=1e-3, type=float)
+parser.add_argument('--lr1_decay_factor', default=0.8, type=float)
+parser.add_argument('--num_epochs1_before_decay', default=5, type=int)
+parser.add_argument('--initial_learning_rate2', default=1e-5, type=float)
+parser.add_argument('--lr2_decay_factor', default=0.8, type=float)
+parser.add_argument('--num_epochs2_before_decay', default=10, type=int)
 parser.add_argument('--dropout_keep_prob', default=0.5, type=float)
 parser.add_argument('--weight_decay', default=5e-4, type=float)
 
-VGG_MEAN = [123.68, 116.78, 103.94]
-
-
-def list_images(directory):
-    """
-    Get all the images and labels in directory/label/*.jpg
-    """
-    labels = os.listdir(directory)
-    # Sort the labels so that training and validation get them in the same order
-    labels.sort()
-
-    files_and_labels = []
-    for label in labels:
-        for f in os.listdir(os.path.join(directory, label)):
-            files_and_labels.append((os.path.join(directory, label, f), label))
-
-    filenames, labels = zip(*files_and_labels)
-    filenames = list(filenames)
-    labels = list(labels)
-    unique_labels = list(set(labels))
-
-    label_to_int = {}
-    for i, label in enumerate(unique_labels):
-        label_to_int[label] = i
-
-    labels = [label_to_int[l] for l in labels]
-
-    return filenames, labels
-
-
-def check_accuracy(sess, correct_prediction, is_training, dataset_init_op):
-    """
-    Check the accuracy of the model on either train or val (depending on dataset_init_op).
-    """
-    # Initialize the correct dataset
-    sess.run(dataset_init_op)
-    num_correct, num_samples = 0, 0
-    while True:
-        try:
-            correct_pred = sess.run(correct_prediction, {is_training: False})
-            num_correct += correct_pred.sum()
-            num_samples += correct_pred.shape[0]
-        except tf.errors.OutOfRangeError:
-            break
-
-    # Return the fraction of datapoints that were correctly classified
-    acc = float(num_correct) / num_samples
-    return acc
-
-
-def create_summary(sess, correct_prediction, loss, is_training, dataset_init_op):
-    """
-    Create model summaries of accuracy and loss.
-    """
-    # Initialize the correct dataset
-    sess.run(dataset_init_op)
-    num_correct, num_samples, total_cost = 0, 0, 0
-    while True:
-        try:
-            correct_pred = sess.run(correct_prediction, {is_training:False})
-            current_cost = sess.run(loss, {is_training: False})
-            num_correct += correct_pred.sum()
-            num_samples += correct_pred.shape[0]
-            total_cost += current_cost * correct_pred.shape[0]
-        except tf.errors.OutOfRangeError:
-            break
-
-    # Return the fraction of datapoints that were correctly classified
-    acc = float(num_correct) / num_samples
-    loss_eval = float(total_cost) / num_samples
-    # The graph has been finalized so we cannot modify it here, i.e. we cannot use tf.summary.scalar here
-
-    return loss_eval, acc
-
 
 def main(args):
-    # Get the list of filenames and corresponding list of labels for training et validation
+    # Get the list of filenames and corresponding list of labels for training and validation
     train_filenames, train_labels = list_images(args.train_dir)
     val_filenames, val_labels = list_images(args.val_dir)
     assert set(train_labels) == set(val_labels),\
-           "Train and val labels don't correspond:\n{}\n{}".format(set(train_labels),
-                                                                   set(val_labels))
+        "Train and validation labels don't match:\n{}\n{}".format(set(train_labels), set(val_labels))
 
+    num_samples = len(train_filenames)
     num_classes = len(set(train_labels))
 
     # --------------------------------------------------------------------------
-    # In TensorFlow, you first want to define the computation graph with all the
+    # In TensorFlow, you first want to define the computational graph with all the
     # necessary operations: loss, training op, accuracy...
     # Any tensor created in the `graph.as_default()` scope will be part of `graph`
     graph = tf.Graph()
     with graph.as_default():
-        tf.set_random_seed(1)  # to keep consistent results
-        # Standard preprocessing for VGG on ImageNet taken from here:
-        # https://github.com/tensorflow/models/blob/master/research/slim/preprocessing/vgg_preprocessing.py
-        # Also see the VGG paper for more details: https://arxiv.org/pdf/1409.1556.pdf
-
-        # Preprocessing (for both training and validation):
-        # (1) Decode the image from jpg format
-        # (2) Resize the image so its smaller side is 256 pixels long
-        def _parse_function(filename, label):
-            image_string = tf.read_file(filename)
-            image_decoded = tf.image.decode_jpeg(image_string, channels=3)          # (1)
-            image = tf.cast(image_decoded, tf.float32)
-
-            smallest_side = 256.0
-            height, width = tf.shape(image)[0], tf.shape(image)[1]
-            height = tf.to_float(height)
-            width = tf.to_float(width)
-
-            scale = tf.cond(tf.greater(height, width),
-                            lambda: smallest_side / width,
-                            lambda: smallest_side / height)
-            new_height = tf.to_int32(height * scale)
-            new_width = tf.to_int32(width * scale)
-
-            resized_image = tf.image.resize_images(image, [new_height, new_width])  # (2)
-            return resized_image, label
-
-        # Preprocessing (for training)
-        # (3) Take a random 224x224 crop to the scaled image
-        # (4) Horizontally flip the image with probability 1/2
-        # (5) Substract the per color mean `VGG_MEAN`
-        # Note: we don't normalize the data here, as VGG was trained without normalization
-        def training_preprocess(image, label):
-            crop_image = tf.random_crop(image, [224, 224, 3])                       # (3)
-            flip_image = tf.image.random_flip_left_right(crop_image)                # (4)
-
-            means = tf.reshape(tf.constant(VGG_MEAN), [1, 1, 3])
-            centered_image = flip_image - means                                     # (5)
-
-            return centered_image, label
-
-        # Preprocessing (for validation)
-        # (3) Take a central 224x224 crop to the scaled image
-        # (4) Substract the per color mean `VGG_MEAN`
-        # Note: we don't normalize the data here, as VGG was trained without normalization
-        def val_preprocess(image, label):
-            crop_image = tf.image.resize_image_with_crop_or_pad(image, 224, 224)    # (3)
-
-            means = tf.reshape(tf.constant(VGG_MEAN), [1, 1, 3])
-            centered_image = crop_image - means                                     # (4)
-
-            return centered_image, label
+        tf.set_random_seed(2018)  # to keep consistent results
 
         # ----------------------------------------------------------------------
-        # DATASET CREATION using tf.contrib.data.Dataset
-        # https://github.com/tensorflow/tensorflow/tree/master/tensorflow/contrib/data
+        # DATASET CREATION using tf.data.Dataset
+        # https://github.com/tensorflow/tensorflow/blob/r1.6/tensorflow/python/data/ops/dataset_ops.py
 
-        # The tf.contrib.data.Dataset framework uses queues in the background to feed in
-        # data to the model.
+        # The tf.data.Dataset framework uses queues in the background to feed in data to the model.
         # We initialize the dataset with a list of filenames and labels, and then apply
-        # the preprocessing functions described above.
+        # the preprocessing functions defined in image_preprocessing.py.
         # Behind the scenes, queues will load the filenames, preprocess them with multiple
-        # threads and apply the preprocessing in parallel, and then batch the data
+        # threads and apply the preprocessing in parallel, and then batch the data.
+
+        # TODO: Verify if we need to prefetch the dataset every time after using map function.
 
         # Training dataset
         train_filenames = tf.constant(train_filenames)
         train_labels = tf.constant(train_labels)
-        train_dataset = tf.contrib.data.Dataset.from_tensor_slices((train_filenames, train_labels))
-        train_dataset = train_dataset.map(_parse_function,
-            num_threads=args.num_workers, output_buffer_size=args.batch_size)
-        train_dataset = train_dataset.map(training_preprocess,
-            num_threads=args.num_workers, output_buffer_size=args.batch_size)
+        train_dataset0 = tf.data.Dataset.from_tensor_slices((train_filenames, train_labels))
+        train_dataset0 = train_dataset0.map(parse_function, num_parallel_calls=args.num_workers)
+        train_dataset0 = train_dataset0.prefetch(args.batch_size)
+        train_dataset0 = train_dataset0.map(training_preprocess, num_parallel_calls=args.num_workers)
+        train_dataset0 = train_dataset0.prefetch(args.batch_size)
+
+        if args.data_augmentation:
+            train_dataset1 = tf.data.Dataset.from_tensor_slices((train_filenames, train_labels))
+            train_dataset1 = train_dataset1.map(parse_function, num_parallel_calls=args.num_workers)
+            train_dataset1 = train_dataset1.prefetch(args.batch_size)
+            train_dataset1 = train_dataset1.map(training_scaling, num_parallel_calls=args.num_workers)
+            train_dataset1 = train_dataset1.prefetch(args.batch_size)
+            train_dataset1 = train_dataset1.map(training_add_shades, num_parallel_calls=args.num_workers)
+            train_dataset1 = train_dataset1.prefetch(args.batch_size)
+
+            train_dataset2 = tf.data.Dataset.from_tensor_slices((train_filenames, train_labels))
+            train_dataset2 = train_dataset2.map(parse_function, num_parallel_calls=args.num_workers)
+            train_dataset2 = train_dataset2.prefetch(args.batch_size)
+            train_dataset2 = train_dataset2.map(training_flip, num_parallel_calls=args.num_workers)
+            train_dataset2 = train_dataset2.prefetch(args.batch_size)
+            train_dataset2 = train_dataset2.map(training_add_shades, num_parallel_calls=args.num_workers)
+            train_dataset2 = train_dataset2.prefetch(args.batch_size)
+
+            train_dataset = train_dataset0.concatenate(train_dataset1)
+            train_dataset = train_dataset.concatenate(train_dataset2)
+        else:
+            train_dataset = train_dataset0
+
         train_dataset = train_dataset.shuffle(buffer_size=10000)  # don't forget to shuffle
         batched_train_dataset = train_dataset.batch(args.batch_size)
 
         # Validation dataset
         val_filenames = tf.constant(val_filenames)
         val_labels = tf.constant(val_labels)
-        val_dataset = tf.contrib.data.Dataset.from_tensor_slices((val_filenames, val_labels))
-        val_dataset = val_dataset.map(_parse_function,
-            num_threads=args.num_workers, output_buffer_size=args.batch_size)
-        val_dataset = val_dataset.map(val_preprocess,
-            num_threads=args.num_workers, output_buffer_size=args.batch_size)
+        val_dataset = tf.data.Dataset.from_tensor_slices((val_filenames, val_labels))
+        val_dataset = val_dataset.map(parse_function, num_parallel_calls=args.num_workers)
+        val_dataset = val_dataset.prefetch(args.batch_size)
+        val_dataset = val_dataset.map(val_preprocess, num_parallel_calls=args.num_workers)
+        val_dataset = val_dataset.prefetch(args.batch_size)
         batched_val_dataset = val_dataset.batch(args.batch_size)
 
-
+        # ---------------------------------------------------------------------
         # Now we define an iterator that can operator on either dataset.
         # The iterator can be reinitialized by calling:
         #     - sess.run(train_init_op) for 1 epoch on the training set
-        #     - sess.run(val_init_op)   for 1 epoch on the valiation set
+        #     - sess.run(val_init_op)   for 1 epoch on the validation set
         # Once this is done, we don't need to feed any value for images and labels
         # as they are automatically pulled out from the iterator queues.
 
@@ -268,14 +189,13 @@ def main(args):
         train_init_op = iterator.make_initializer(batched_train_dataset)
         val_init_op = iterator.make_initializer(batched_val_dataset)
 
-        # Indicates whether we are in training or in test mode
+        # Indicates whether we are in training or in testing mode
         is_training = tf.placeholder(tf.bool)
 
         # ---------------------------------------------------------------------
         # Now that we have set up the data, it's time to set up the model.
         # For this example, we'll use VGG-16 pretrained on ImageNet. We will remove the
-        # last fully connected layer (fc8) and replace it with our own, with an
-        # output size num_classes=8
+        # last fully connected layer (fc8) and replace it with our own, with an output size num_classes.
         # We will first train the last layer for a few epochs.
         # Then we will train the entire model on our dataset for a few epochs.
 
@@ -289,119 +209,209 @@ def main(args):
             logits, _ = vgg.vgg_16(images, num_classes=num_classes, is_training=is_training,
                                    dropout_keep_prob=args.dropout_keep_prob)
 
-        # Specify where the model checkpoint is (pretrained weights).
-        model_path = args.model_path
-        assert(os.path.isfile(model_path))
+        if args.train_from_vgg:
+            # Specify where the model checkpoint is (pretrained weights)
+            model_path = args.pretrained_model_path
+            assert(os.path.isfile(model_path))
 
-        # Restore only the layers up to fc7 (included)
-        # Calling function `init_fn(sess)` will load all the pretrained weights.
-        variables_to_restore = tf.contrib.framework.get_variables_to_restore(exclude=['vgg_16/fc8'])
-        init_fn = tf.contrib.framework.assign_from_checkpoint_fn(model_path, variables_to_restore)
+            # Restore only the layers up to fc7 (included)
+            # Calling function `init_fn(sess)` will load all the pretrained weights.
+            variables_to_restore = tf.contrib.framework.get_variables_to_restore(exclude=['vgg_16/fc8'])
+            init_fn = tf.contrib.framework.assign_from_checkpoint_fn(model_path, variables_to_restore)
 
-        # Initialization operation from scratch for the new "fc8" layers
-        # `get_variables` will only return the variables whose name starts with the given pattern
-        fc8_variables = tf.contrib.framework.get_variables('vgg_16/fc8')
-        fc8_init = tf.variables_initializer(fc8_variables)
+            # Initialization operation from scratch for the new "fc8" layers
+            # `get_variables` will only return the variables whose name starts with the given pattern
+            fc8_variables = tf.contrib.framework.get_variables('vgg_16/fc8')
+            fc8_init = tf.variables_initializer(fc8_variables)
 
         # ---------------------------------------------------------------------
         # Using tf.losses, any loss is added to the tf.GraphKeys.LOSSES collection
         # We can then call the total loss easily
         tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
         loss = tf.losses.get_total_loss()
+        # # For multi-label problem:
+        # tf.losses.sigmoid_cross_entropy(multi_class_labels=labels, logits=logits)
+        # loss = tf.losses.get_total_loss()
+        # # For weighted loss:
+        # tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits,
+        #                                        weights=tf.where(tf.equal(labels, 0),
+        #                                                         tf.fill(tf.shape(labels), 0.01),  # For illustration
+        #                                                         tf.fill(tf.shape(labels), 1.0)))
+        # loss = tf.losses.get_total_loss()
 
-        # First we want to train only the reinitialized last layer fc8 for a few epochs.
-        # We run minimize the loss only with respect to the fc8 variables (weight and bias).
-        fc8_optimizer = tf.train.GradientDescentOptimizer(args.learning_rate1)
-        fc8_train_op = fc8_optimizer.minimize(loss, var_list=fc8_variables)
+        global_step = tf.Variable(0, trainable=False, name='global_step')
+        num_batches_per_epoch = num_samples / args.batch_size
+
+        if args.train_from_vgg:
+            gs_init = tf.variables_initializer([global_step])
+
+            # First we want to train only the reinitialized last layer fc8 for a few epochs.
+            # We minimize the loss only with respect to the fc8 variables (weight and bias).
+            decay_steps1 = int(args.num_epochs1_before_decay * num_batches_per_epoch)
+            lr1 = tf.train.exponential_decay(
+                learning_rate=args.initial_learning_rate1,
+                global_step=global_step,
+                decay_steps=decay_steps1,
+                decay_rate=args.lr1_decay_factor,
+                staircase=True
+            )
+            if args.optimizer == 'GradientDescent':
+                fc8_optimizer = tf.train.GradientDescentOptimizer(lr1)
+            elif args.optimizer == 'Momentum':
+                fc8_optimizer = tf.train.MomentumOptimizer(lr1, 0.9)  # TODO: Add tuning for beta
+            else:
+                print('Optimizer not found.')
+                sys.exit(1)
+
+            fc8_train_op = fc8_optimizer.minimize(loss, global_step=global_step, var_list=fc8_variables)
 
         # Then we want to finetune the entire model for a few epochs.
-        # We run minimize the loss only with respect to all the variables.
-        full_optimizer = tf.train.GradientDescentOptimizer(args.learning_rate2)
-        full_train_op = full_optimizer.minimize(loss)
+        # We minimize the loss with respect to all the variables.
+        decay_steps2 = int(args.num_epochs2_before_decay * num_batches_per_epoch)
+        lr2 = tf.train.exponential_decay(
+            learning_rate=args.initial_learning_rate2,
+            global_step=global_step,
+            decay_steps=decay_steps2,
+            decay_rate=args.lr2_decay_factor,
+            staircase=True
+        )
+        if args.optimizer == 'GradientDescent':
+            full_optimizer = tf.train.GradientDescentOptimizer(lr2)
+        elif args.optimizer == 'Momentum':
+            full_optimizer = tf.train.MomentumOptimizer(lr2, 0.9)  # TODO: Add tuning for beta
+        else:
+            print('Optimizer not found.')
+            sys.exit(1)
+
+        full_train_op = full_optimizer.minimize(loss, global_step=global_step)
 
         # Evaluation metrics
         prediction = tf.to_int32(tf.argmax(logits, 1))
         correct_prediction = tf.equal(prediction, labels)
-        # accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+        # # For multi-label problem: use Intersection/Union (IoU)
+        # condition = tf.greater_equal(logits, 0.5)  # TODO: tune the threshold (currently pred = 1 if logits >= 0.5)
+        # # Since logits has a dynamic size, we should use tf.fill here instead of tf.constant
+        # prediction = tf.where(condition, tf.fill(tf.shape(logits), 1), tf.fill(tf.shape(logits), 0))
+        # intersection = tf.logical_and(tf.cast(labels, tf.bool), tf.case(prediction, tf.bool))
+        # union = tf.logical_or(tf.cast(labels, tf.bool), tf.cast(prediction, tf.bool))
+        # intersection_sum = tf.reduce_sum(tf.cast(intersection, tf.int32), axis=1)
+        # union_sum = tf.reduce_sum(tf.cast(union, tf.int32), axis=1)
+        # correct_prediction = tf.divide(intersection_sum, union_sum)
 
-        loss_eval = tf.placeholder(tf.float32, shape=(), name="loss_ph")
-        tf.summary.scalar("loss", loss_eval)
-        accuracy = tf.placeholder(tf.float32, shape=(), name="acc_ph")
-        tf.summary.scalar("accuracy", accuracy)
-        merged = tf.summary.merge_all()
+        loss_eval = tf.placeholder(tf.float32, shape=(), name='loss_ph')
+        tf.summary.scalar('loss', loss_eval)
+        accuracy = tf.placeholder(tf.float32, shape=(), name='acc_ph')
+        tf.summary.scalar('accuracy', accuracy)
+        lr_eval = tf.placeholder(tf.float32, shape=(), name='lr_ph')
+        tf.summary.scalar('learning_rate', lr_eval)
+        # merged = tf.summary.merge_all()
+        train_merged = tf.summary.merge([loss_eval, accuracy, lr_eval])
+        val_merged = tf.summary.merge([loss_eval, accuracy])
 
         # Create a model saver
         saver = tf.train.Saver()
 
-        tf.get_default_graph().finalize()
+        if args.train_from_vgg:
+            tf.get_default_graph().finalize()
 
     # --------------------------------------------------------------------------
-    # Now that we have built the graph and finalized it, we define the session.
+    # Now that we have built the graph and finalized it (if training from pretrained VGG), we define the session.
     # The session is the interface to *run* the computational graph.
-    # We can call our training operations with `sess.run(train_op)` for instance
+    # We can call our training operations with `sess.run(train_op)` for instance.
     with tf.Session(graph=graph) as sess:
-        init_fn(sess)  # load the pretrained weights
-        sess.run(fc8_init)  # initialize the new fc8 layer
+        if args.train_from_vgg:
+            sess.run(gs_init)  # initialize the global step
+            init_fn(sess)  # load the pretrained weights
+            sess.run(fc8_init)  # initialize the new fc8 layer
+        else:
+            sess.run(tf.global_variables_initializer())
 
         # Create a summary writer
         train_writer = tf.summary.FileWriter(args.new_model_save_path + "summaries/train/", sess.graph)
         val_writer = tf.summary.FileWriter(args.new_model_save_path + "summaries/val/", sess.graph)
 
-        # Update only the last layer for a few epochs.
-        for epoch in range(args.num_epochs1):
-            # Run an epoch over the training data.
-            print('Starting epoch %d / %d' % (epoch + 1, args.num_epochs1))
-            # Here we initialize the iterator with the training set.
-            # This means that we can go through an entire epoch until the iterator becomes empty.
-            sess.run(train_init_op)
-            while True:
-                try:
-                    _ = sess.run(fc8_train_op, {is_training: True})
-                except tf.errors.OutOfRangeError:
-                    break
+        if args.train_from_vgg:
+            # Update only the last layer for a few epochs.
+            for epoch in range(args.num_epochs1):
+                # Run an epoch over the training data.
+                print('Starting epoch %d / %d' % (epoch + 1, args.num_epochs1))
+                # Here we initialize the iterator with the training dataset.
+                # This means that we can go through an entire epoch until the iterator becomes empty.
+                sess.run(train_init_op)
+                while True:
+                    try:
+                        _ = sess.run(fc8_train_op, {is_training: True})
+                    except tf.errors.OutOfRangeError:
+                        break
 
-            # Check accuracy on the train and val sets every epoch.
-            train_acc = check_accuracy(sess, correct_prediction, is_training, train_init_op)
-            val_acc = check_accuracy(sess, correct_prediction, is_training, val_init_op)
-            print('Train accuracy: %f' % train_acc)
-            print('Val accuracy: %f\n' % val_acc)
+                # Create summary for accuracy, loss and learning rate (lr only for training summary)
+                loss_train, acc_train, lr_train = create_summary(sess, correct_prediction, loss, lr1,
+                                                                 is_training, train_init_op)
+                loss_val, acc_val = create_summary(sess, correct_prediction, loss, None, is_training, val_init_op)
+                train_summ = sess.run(train_merged, feed_dict={loss_eval: loss_train, accuracy: acc_train,
+                                                               lr_eval: lr_train})
+                val_summ = sess.run(val_merged, feed_dict={loss_eval: loss_val, accuracy: acc_val})
+                train_writer.add_summary(train_summ, epoch)
+                val_writer.add_summary(val_summ, epoch)
 
-            loss_train, acc_train = create_summary(sess, correct_prediction, loss, is_training, train_init_op)
-            loss_val, acc_val = create_summary(sess, correct_prediction, loss, is_training, val_init_op)
-            train_summ = sess.run(merged, feed_dict={loss_eval: loss_train, accuracy: acc_train})
-            val_summ = sess.run(merged, feed_dict={loss_eval: loss_val, accuracy: acc_val})
-            train_writer.add_summary(train_summ, epoch)
-            val_writer.add_summary(val_summ, epoch)
+                if (epoch+1) % 10 == 0:  # save model checkpoints every 10 epochs
+                    saver.save(sess, args.new_model_save_path + 'phase1')
 
-            if (epoch+1) % 5 == 0:  # save model checkpoints every 5 epochs
-                saver.save(sess, args.new_model_save_path + 'phase1')
+            # Train the entire model for a few more epochs, continuing with the *same* weights.
+            for epoch in range(args.num_epochs2):
+                print('Starting epoch %d / %d' % (epoch + 1, args.num_epochs2))
+                sess.run(train_init_op)
+                while True:
+                    try:
+                        _ = sess.run(full_train_op, {is_training: True})
+                    except tf.errors.OutOfRangeError:
+                        break
 
+                # Create summary for accuracy, loss and learning rate (lr only for training summary)
+                loss_train, acc_train, lr_train = create_summary(sess, correct_prediction, loss, lr2,
+                                                                 is_training, train_init_op)
+                loss_val, acc_val = create_summary(sess, correct_prediction, loss, None, is_training, val_init_op)
+                train_summ = sess.run(train_merged, feed_dict={loss_eval: loss_train, accuracy: acc_train,
+                                                               lr_eval: lr_train})
+                val_summ = sess.run(val_merged, feed_dict={loss_eval: loss_val, accuracy: acc_val})
+                train_writer.add_summary(train_summ, epoch+args.num_epochs1)
+                val_writer.add_summary(val_summ, epoch+args.num_epochs1)
 
-        # Train the entire model for a few more epochs, continuing with the *same* weights.
-        for epoch in range(args.num_epochs2):
-            print('Starting epoch %d / %d' % (epoch + 1, args.num_epochs2))
-            sess.run(train_init_op)
-            while True:
-                try:
-                    _ = sess.run(full_train_op, {is_training: True})
-                except tf.errors.OutOfRangeError:
-                    break
+                if (epoch + 1) % 10 == 0:  # save model checkpoints every 10 epochs
+                    saver.save(sess, args.new_model_save_path + 'phase2')
 
-            # Check accuracy on the train and val sets every epoch
-            train_acc = check_accuracy(sess, correct_prediction, is_training, train_init_op)
-            val_acc = check_accuracy(sess, correct_prediction, is_training, val_init_op)
-            print('Train accuracy: %f' % train_acc)
-            print('Val accuracy: %f\n' % val_acc)
+        else:
+            # Try to load model checkpoints if there are any
+            try:
+                saver.restore(sess, args.pretrained_model_path + 'phase1')  # change to `phase2` if needed
+                print('Model restored.')
+            except (tf.errors.InvalidArgumentError, tf.errors.NotFoundError) as e:
+                print(e)
+                sys.exit(1)
 
-            loss_train, acc_train = create_summary(sess, correct_prediction, loss, is_training, train_init_op)
-            loss_val, acc_val = create_summary(sess, correct_prediction, loss, is_training, val_init_op)
-            train_summ = sess.run(merged, feed_dict={loss_eval: loss_train, accuracy: acc_train})
-            val_summ = sess.run(merged, feed_dict={loss_eval: loss_val, accuracy: acc_val})
-            train_writer.add_summary(train_summ, epoch+args.num_epochs1)
-            val_writer.add_summary(val_summ, epoch+args.num_epochs1)
+            # Train the entire model for a few more epochs, continuing with the *same* weights.
+            for epoch in range(args.num_epochs2):
+                print('Starting epoch %d / %d' % (epoch + 1, args.num_epochs2))
+                sess.run(train_init_op)
+                while True:
+                    try:
+                        _ = sess.run(full_train_op, {is_training: True})
+                    except tf.errors.OutOfRangeError:
+                        break
 
-            if (epoch+1) % 5 == 0:  # save model checkpoints every 5 epochs
-                saver.save(sess, args.new_model_save_path + 'phase2')
+                # Create summary for accuracy, loss and learning rate (lr only for training summary)
+                loss_train, acc_train, lr_train = create_summary(sess, correct_prediction, loss, lr2,
+                                                                 is_training, train_init_op)
+                loss_val, acc_val = create_summary(sess, correct_prediction, loss, None, is_training, val_init_op)
+                train_summ = sess.run(train_merged, feed_dict={loss_eval: loss_train, accuracy: acc_train,
+                                                               lr_eval: lr_train})
+                val_summ = sess.run(val_merged, feed_dict={loss_eval: loss_val, accuracy: acc_val})
+                train_writer.add_summary(train_summ, epoch+100)  # depend on how many epochs you have trained before
+                val_writer.add_summary(val_summ, epoch+100)  # depend on how many epochs you have trained before
+                # TODO: See if there is a way to automatically find out how many epochs we have trained before
+
+                if (epoch + 1) % 10 == 0:  # save model checkpoints every 10 epochs
+                    saver.save(sess, args.new_model_save_path + 'phase2')
 
 
 if __name__ == '__main__':
