@@ -383,7 +383,7 @@ def main(args):
         else:
             # Try to load model checkpoints if there are any
             try:
-                saver.restore(sess, args.pretrained_model_path + 'phase1')  # change to `phase2` if needed
+                saver.restore(sess, os.path.join(args.model_save_path, 'phase1'))  # change to `phase2` if needed
                 print('Model restored.')
             except (tf.errors.InvalidArgumentError, tf.errors.NotFoundError) as e:
                 print(e)
