@@ -167,7 +167,7 @@ def main(args):
             except tf.errors.OutOfRangeError:
                 break
         
-        np.save(args.save_dir + 'pred array batch.npy', res)
+        np.save(os.path.join(args.save_dir, 'pred array batch.npy'), res)
         
         flat_files = [item for sublist in files for item in sublist]
         with open(os.path.join(args.save_dir, 'test_image_filenames.txt'), 'w') as fout:
